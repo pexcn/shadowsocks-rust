@@ -357,6 +357,9 @@ struct SSConfig {
     no_delay: Option<bool>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    printable_salt: Option<bool>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     keep_alive: Option<u64>,
 
     #[cfg(all(unix, not(target_os = "android")))]
@@ -1528,6 +1531,8 @@ pub struct Config {
 
     /// Set `TCP_NODELAY` socket option
     pub no_delay: bool,
+    /// Experimental printable salts for outgoing client TCP streams.
+    pub printable_salt: bool,
     /// Set `TCP_FASTOPEN` socket option
     pub fast_open: bool,
     /// Set TCP Keep-Alive duration, will set both `TCP_KEEPIDLE` and `TCP_KEEPINTVL`
@@ -1691,6 +1696,7 @@ impl Config {
             ipv6_only: false,
 
             no_delay: false,
+            printable_salt: false,
             fast_open: false,
             keep_alive: None,
             mptcp: false,
@@ -2529,6 +2535,10 @@ impl Config {
             nconfig.dns_cache_size = config.dns_cache_size;
         }
 
+        if config_type.is_local() {
+            nconfig.printable_salt = config.printable_salt.unwrap_or(false);
+        }
+
         // TCP nodelay
         if let Some(b) = config.no_delay {
             nconfig.no_delay = b;
@@ -2844,6 +2854,19 @@ impl Config {
 
     /// Check if all required fields are already set
     pub fn check_integrity(&self) -> Result<(), Error> {
+        if self.config_type.is_local()
+            && self.printable_salt
+            && self.server.iter().any(|inst| {
+                !shadowsocks::context::Context::supports_printable_salt(inst.config.method())
+            })
+        {
+            return Err(Error::new(
+                ErrorKind::Invalid,
+                "printable_salt requires a supported cipher with a 32-byte TCP salt",
+                None,
+            ));
+        }
+
         if self.config_type.is_local() {
             if self.local.is_empty() {
                 let err = Error::new(
@@ -3341,6 +3364,10 @@ impl fmt::Display for Config {
             jconf.no_delay = Some(self.no_delay);
         }
 
+        if self.config_type.is_local() && self.printable_salt {
+            jconf.printable_salt = Some(true);
+        }
+
         if self.fast_open {
             jconf.fast_open = Some(self.fast_open);
         }
@@ -3464,6 +3491,54 @@ pub fn read_variable_field_value(value: &str) -> Cow<'_, str> {
 #[cfg(test)]
 mod tests {
     use super::OutboundProxy;
+
+    #[cfg(any(feature = "aead-cipher", feature = "aead-cipher-2022"))]
+    #[test]
+    fn printable_salt_config_is_opt_in_and_local_only() {
+        use super::{Config, ConfigType};
+
+        for (method, password, supported) in [
+            #[cfg(feature = "aead-cipher")]
+            ("aes-256-gcm", "test", true),
+            #[cfg(feature = "aead-cipher")]
+            ("chacha20-ietf-poly1305", "test", true),
+            #[cfg(feature = "aead-cipher")]
+            ("aes-128-gcm", "test", false),
+            #[cfg(feature = "aead-cipher-2022")]
+            ("2022-blake3-aes-256-gcm", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", true),
+            #[cfg(feature = "aead-cipher-2022")]
+            ("2022-blake3-chacha20-poly1305", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", true),
+            #[cfg(feature = "aead-cipher-2022-extra")]
+            ("2022-blake3-chacha8-poly1305", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", true),
+            #[cfg(feature = "aead-cipher-2022")]
+            ("2022-blake3-aes-128-gcm", "AAAAAAAAAAAAAAAAAAAAAA==", false),
+        ] {
+            let mut value = serde_json::json!({
+                "server": "127.0.0.1", "server_port": 8388,
+                "local_address": "127.0.0.1", "local_port": 1080,
+                "method": method, "password": password
+            });
+            let config = Config::load_from_str(&value.to_string(), ConfigType::Local).unwrap();
+            assert!(!config.printable_salt);
+            assert!(config.check_integrity().is_ok());
+
+            value["printable_salt"] = true.into();
+            let config = Config::load_from_str(&value.to_string(), ConfigType::Local).unwrap();
+            assert!(config.printable_salt);
+            assert_eq!(config.check_integrity().is_ok(), supported);
+            let saved = Config::load_from_str(&config.to_string(), ConfigType::Local).unwrap();
+            assert!(saved.printable_salt);
+
+            let server = Config::load_from_str(&value.to_string(), ConfigType::Server).unwrap();
+            assert!(!server.printable_salt);
+            assert!(server.check_integrity().is_ok());
+
+            value["printable_salt"] = false.into();
+            let config = Config::load_from_str(&value.to_string(), ConfigType::Local).unwrap();
+            assert!(!config.printable_salt);
+            assert!(config.check_integrity().is_ok());
+        }
+    }
 
     #[test]
     fn outbound_proxy_url_without_auth() {

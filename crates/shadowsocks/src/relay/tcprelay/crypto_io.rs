@@ -334,6 +334,7 @@ pub struct CryptoStream<S> {
     enc: EncryptedWriter,
     method: CipherKind,
     has_handshaked: bool,
+    printable_salt: bool,
 }
 
 impl<S> fmt::Debug for CryptoStream<S> {
@@ -363,10 +364,11 @@ impl<S> CryptoStream<S> {
         user_manager: Option<Arc<ServerUserManager>>,
     ) -> Self {
         let category = method.category();
+        let printable_salt = stream_ty == StreamType::Client && context.printable_salt();
 
         if category == CipherCategory::None {
             // Fast-path for none cipher
-            return Self::new_none(stream, method);
+            return Self::new_none(stream, method, printable_salt);
         }
 
         let prev_len = match category {
@@ -390,7 +392,7 @@ impl<S> CryptoStream<S> {
             #[cfg(feature = "aead-cipher")]
             CipherCategory::Aead => {
                 let mut local_salt = vec![0u8; prev_len];
-                context.generate_nonce(method, &mut local_salt, true);
+                context.generate_nonce_with_prefix(method, &mut local_salt, true, printable_salt);
                 trace!("generated AEAD cipher salt {:?}", ByteStr::new(&local_salt));
                 local_salt
             }
@@ -404,7 +406,7 @@ impl<S> CryptoStream<S> {
                 // AEAD-2022 has a request-salt in respond header, so the generated salt doesn't need to be remembered.
 
                 let mut local_salt = vec![0u8; prev_len];
-                context.generate_nonce(method, &mut local_salt, false);
+                context.generate_nonce_with_prefix(method, &mut local_salt, false, printable_salt);
                 trace!("generated AEAD cipher salt {:?}", ByteStr::new(&local_salt));
                 local_salt
             }
@@ -416,16 +418,18 @@ impl<S> CryptoStream<S> {
             enc: EncryptedWriter::with_identity(stream_ty, method, key, &iv, identity_keys),
             method,
             has_handshaked: false,
+            printable_salt,
         }
     }
 
-    fn new_none(stream: S, method: CipherKind) -> Self {
+    fn new_none(stream: S, method: CipherKind, printable_salt: bool) -> Self {
         Self {
             stream,
             dec: DecryptedReader::None,
             enc: EncryptedWriter::None,
             method,
             has_handshaked: false,
+            printable_salt,
         }
     }
 
@@ -572,6 +576,19 @@ where
         cx: &mut task::Context<'_>,
         buf: &[u8],
     ) -> Poll<ProtocolResult<usize>> {
+        if self.printable_salt {
+            if !Context::supports_printable_salt(self.method) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "printable_salt requires a supported cipher with a 32-byte TCP salt",
+                )
+                .into())
+                .into();
+            }
+            if buf.is_empty() {
+                return Ok(0).into();
+            }
+        }
         let Self {
             ref mut enc,
             ref mut stream,

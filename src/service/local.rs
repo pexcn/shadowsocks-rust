@@ -225,6 +225,7 @@ pub fn define_command_line_options(mut app: Command) -> Command {
     .arg(Arg::new("DNS_CACHE_SIZE").long("dns-cache-size").num_args(1).action(ArgAction::Set).value_parser(clap::value_parser!(usize)).help("DNS cache size in number of records. Works when trust-dns DNS backend is enabled."))
     .arg(Arg::new("TCP_NO_DELAY").long("tcp-no-delay").alias("no-delay").action(ArgAction::SetTrue).help("Set TCP_NODELAY option for sockets"))
     .arg(Arg::new("TCP_FAST_OPEN").long("tcp-fast-open").alias("fast-open").action(ArgAction::SetTrue).help("Enable TCP Fast Open (TFO)"))
+    .arg(Arg::new("PRINTABLE_SALT").long("printable-salt").action(ArgAction::SetTrue).help("Experimental printable TCP salt for supported 32-byte-salt AEAD and AEAD-2022 ciphers"))
     .arg(Arg::new("TCP_KEEP_ALIVE").long("tcp-keep-alive").num_args(1).action(ArgAction::Set).value_parser(clap::value_parser!(u64)).help("Set TCP keep alive timeout seconds"))
     .arg(Arg::new("TCP_MULTIPATH").long("tcp-multipath").alias("mptcp").action(ArgAction::SetTrue).help("Enable Multipath-TCP (MPTCP)"))
     .arg(Arg::new("UDP_TIMEOUT").long("udp-timeout").num_args(1).action(ArgAction::Set).value_parser(clap::value_parser!(u64)).help("Timeout seconds for UDP relay"))
@@ -851,6 +852,10 @@ pub fn create(matches: &ArgMatches) -> ShadowsocksResult<(Runtime, impl Future<O
 
         if matches.get_flag("TCP_NO_DELAY") {
             config.no_delay = true;
+        }
+
+        if matches.get_flag("PRINTABLE_SALT") {
+            config.printable_salt = true;
         }
 
         if matches.get_flag("TCP_FAST_OPEN") {

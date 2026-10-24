@@ -35,6 +35,7 @@ stream-cipher = [
 aead-cipher = [
     "shadowsocks-crypto/v1-aead",
     "shadowsocks-crypto/aws-lc",
+    "rand",
 ]
 
 # Enable extra AEAD ciphers

@@ -26,6 +26,7 @@ pub struct Context {
 
     // Connect IPv6 address first
     ipv6_first: bool,
+    printable_salt: bool,
 }
 
 /// `Context` for sharing between services
@@ -39,6 +40,7 @@ impl Context {
             replay_policy: ReplayAttackPolicy::Default,
             dns_resolver: Arc::new(DnsResolver::system_resolver()),
             ipv6_first: false,
+            printable_salt: false,
         }
     }
 
@@ -61,6 +63,17 @@ impl Context {
 
     /// Generate nonce (IV or SALT)
     pub fn generate_nonce(&self, method: CipherKind, nonce: &mut [u8], unique: bool) {
+        self.generate_nonce_with_prefix(method, nonce, unique, false);
+    }
+
+    pub(crate) fn generate_nonce_with_prefix(
+        &self,
+        method: CipherKind,
+        nonce: &mut [u8],
+        unique: bool,
+        printable: bool,
+    ) {
+        let _ = printable;
         if nonce.is_empty() {
             return;
         }
@@ -70,6 +83,17 @@ impl Context {
             use crate::crypto::utils::random_iv_or_salt;
 
             random_iv_or_salt(nonce);
+
+            #[cfg(any(feature = "aead-cipher", feature = "aead-cipher-2022"))]
+            if printable && Self::supports_printable_salt(method) {
+                use rand::RngExt;
+
+                let mut rng = rand::rng();
+                let length = rng.random_range(6..=12);
+                for byte in &mut nonce[..length] {
+                    *byte = rng.random_range(0x20..=0x7e);
+                }
+            }
 
             // Salt already exists, generate a new one.
             if unique && self.check_nonce_and_set(method, nonce) {
@@ -117,6 +141,29 @@ impl Context {
                     Ok(())
                 }
             }
+        }
+    }
+
+    /// Enable experimental printable salts for outgoing client TCP streams.
+    pub fn set_printable_salt(&mut self, enabled: bool) {
+        self.printable_salt = enabled;
+    }
+
+    /// Whether printable client TCP salts are enabled.
+    pub fn printable_salt(&self) -> bool {
+        self.printable_salt
+    }
+
+    /// Whether the cipher supports the printable salt experiment.
+    pub fn supports_printable_salt(method: CipherKind) -> bool {
+        match method {
+            #[cfg(feature = "aead-cipher")]
+            CipherKind::AES_256_GCM | CipherKind::CHACHA20_POLY1305 => true,
+            #[cfg(feature = "aead-cipher-2022")]
+            CipherKind::AEAD2022_BLAKE3_AES_256_GCM | CipherKind::AEAD2022_BLAKE3_CHACHA20_POLY1305 => true,
+            #[cfg(feature = "aead-cipher-2022-extra")]
+            CipherKind::AEAD2022_BLAKE3_CHACHA8_POLY1305 => true,
+            _ => false,
         }
     }
 

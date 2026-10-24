@@ -240,6 +240,12 @@ impl ServiceContext {
         context.set_ipv6_first(ipv6_first);
     }
 
+    /// Enable printable salts for outgoing client TCP streams.
+    pub fn set_printable_salt(&mut self, enabled: bool) {
+        let context = Arc::get_mut(&mut self.context).expect("cannot set printable_salt on a shared context");
+        context.set_printable_salt(enabled);
+    }
+
     /// Set security config
     pub fn set_security_config(&mut self, security: &SecurityConfig) {
         let context = Arc::get_mut(&mut self.context).expect("cannot set security on a shared context");

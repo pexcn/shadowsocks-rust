@@ -124,6 +124,7 @@ impl Server {
         // Global ServiceContext template
         // Each Local instance will hold a copy of its fields
         let mut context = ServiceContext::new();
+        context.set_printable_salt(config.printable_salt);
 
         let mut connect_opts = ConnectOpts {
             #[cfg(any(target_os = "linux", target_os = "android"))]
