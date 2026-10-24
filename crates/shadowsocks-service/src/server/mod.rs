@@ -198,6 +198,7 @@ pub async fn run(config: Config) -> io::Result<()> {
         }
 
         server_builder.set_security_config(&config.security);
+        server_builder.set_tcp_popcount(config.tcp_popcount);
 
         let server = server_builder.build().await?;
         servers.push(server);

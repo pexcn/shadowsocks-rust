@@ -27,6 +27,7 @@ pub struct Context {
     // Connect IPv6 address first
     ipv6_first: bool,
     printable_salt: bool,
+    tcp_popcount: bool,
 }
 
 /// `Context` for sharing between services
@@ -41,6 +42,7 @@ impl Context {
             dns_resolver: Arc::new(DnsResolver::system_resolver()),
             ipv6_first: false,
             printable_salt: false,
+            tcp_popcount: false,
         }
     }
 
@@ -152,6 +154,27 @@ impl Context {
     /// Whether printable client TCP salts are enabled.
     pub fn printable_salt(&self) -> bool {
         self.printable_salt
+    }
+
+    /// Enable the initial TCP request ciphertext transform on both peers.
+    pub fn set_tcp_popcount(&mut self, enabled: bool) {
+        self.tcp_popcount = enabled;
+    }
+
+    /// Whether the initial TCP request ciphertext transform is enabled.
+    pub fn tcp_popcount(&self) -> bool {
+        self.tcp_popcount
+    }
+
+    /// Whether the cipher provides authenticated TCP framing for the transform.
+    pub fn supports_tcp_popcount(method: CipherKind) -> bool {
+        match method.category() {
+            #[cfg(feature = "aead-cipher")]
+            crate::crypto::CipherCategory::Aead => true,
+            #[cfg(feature = "aead-cipher-2022")]
+            crate::crypto::CipherCategory::Aead2022 => true,
+            _ => false,
+        }
     }
 
     /// Whether the cipher supports the printable salt experiment.

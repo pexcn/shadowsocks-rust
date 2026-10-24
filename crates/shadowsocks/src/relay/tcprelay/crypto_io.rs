@@ -22,6 +22,8 @@ use crate::{
     crypto::{CipherCategory, CipherKind},
 };
 
+use super::popcount::{PopcountIo, TcpPopcount};
+
 #[cfg(feature = "aead-cipher")]
 use super::aead::{DecryptedReader as AeadDecryptedReader, EncryptedWriter as AeadEncryptedWriter};
 #[cfg(feature = "aead-cipher-2022")]
@@ -335,6 +337,7 @@ pub struct CryptoStream<S> {
     method: CipherKind,
     has_handshaked: bool,
     printable_salt: bool,
+    popcount: Option<Box<TcpPopcount>>,
 }
 
 impl<S> fmt::Debug for CryptoStream<S> {
@@ -365,10 +368,18 @@ impl<S> CryptoStream<S> {
     ) -> Self {
         let category = method.category();
         let printable_salt = stream_ty == StreamType::Client && context.printable_salt();
+        let popcount = context.tcp_popcount().then(|| {
+            let key = if stream_ty == StreamType::Client {
+                identity_keys.first().map_or(key, |identity| identity.as_ref())
+            } else {
+                key
+            };
+            Box::new(TcpPopcount::new(stream_ty, method, key))
+        });
 
         if category == CipherCategory::None {
             // Fast-path for none cipher
-            return Self::new_none(stream, method, printable_salt);
+            return Self::new_none(stream, method, printable_salt, popcount);
         }
 
         let prev_len = match category {
@@ -419,10 +430,11 @@ impl<S> CryptoStream<S> {
             method,
             has_handshaked: false,
             printable_salt,
+            popcount,
         }
     }
 
-    fn new_none(stream: S, method: CipherKind, printable_salt: bool) -> Self {
+    fn new_none(stream: S, method: CipherKind, printable_salt: bool, popcount: Option<Box<TcpPopcount>>) -> Self {
         Self {
             stream,
             dec: DecryptedReader::None,
@@ -430,6 +442,7 @@ impl<S> CryptoStream<S> {
             method,
             has_handshaked: false,
             printable_salt,
+            popcount,
         }
     }
 
@@ -548,9 +561,17 @@ where
             ref mut enc,
             ref mut stream,
             ref mut has_handshaked,
+            ref mut popcount,
             ..
         } = *self;
-        ready!(dec.poll_read_decrypted(cx, context, stream, buf))?;
+        let result = match popcount {
+            Some(codec) => dec.poll_read_decrypted(cx, context, &mut PopcountIo { stream, codec }, buf),
+            None => dec.poll_read_decrypted(cx, context, stream, buf),
+        };
+        if popcount.as_ref().is_some_and(|codec| codec.is_done()) {
+            *popcount = None;
+        }
+        ready!(result)?;
 
         if !*has_handshaked && dec.handshaked() {
             *has_handshaked = true;
@@ -576,6 +597,9 @@ where
         cx: &mut task::Context<'_>,
         buf: &[u8],
     ) -> Poll<ProtocolResult<usize>> {
+        if self.popcount.is_some() && buf.is_empty() {
+            return Ok(0).into();
+        }
         if self.printable_salt {
             if !Context::supports_printable_salt(self.method) {
                 return Err(io::Error::new(
@@ -592,9 +616,17 @@ where
         let Self {
             ref mut enc,
             ref mut stream,
+            ref mut popcount,
             ..
         } = *self;
-        enc.poll_write_encrypted(cx, stream, buf)
+        let result = match popcount {
+            Some(codec) => enc.poll_write_encrypted(cx, &mut PopcountIo { stream, codec }, buf),
+            None => enc.poll_write_encrypted(cx, stream, buf),
+        };
+        if popcount.as_ref().is_some_and(|codec| codec.is_done()) {
+            *popcount = None;
+        }
+        result
     }
 }
 
@@ -605,12 +637,28 @@ where
     /// Polls `flush` on the underlying stream
     #[inline]
     pub fn poll_flush(&mut self, cx: &mut task::Context<'_>) -> Poll<ProtocolResult<()>> {
-        Pin::new(&mut self.stream).poll_flush(cx).map_err(Into::into)
+        match self.popcount {
+            Some(ref mut codec) => Pin::new(&mut PopcountIo {
+                stream: &mut self.stream,
+                codec,
+            })
+            .poll_flush(cx)
+            .map_err(Into::into),
+            None => Pin::new(&mut self.stream).poll_flush(cx).map_err(Into::into),
+        }
     }
 
     /// Polls `shutdown` on the underlying stream
     #[inline]
     pub fn poll_shutdown(&mut self, cx: &mut task::Context<'_>) -> Poll<ProtocolResult<()>> {
-        Pin::new(&mut self.stream).poll_shutdown(cx).map_err(Into::into)
+        match self.popcount {
+            Some(ref mut codec) => Pin::new(&mut PopcountIo {
+                stream: &mut self.stream,
+                codec,
+            })
+            .poll_shutdown(cx)
+            .map_err(Into::into),
+            None => Pin::new(&mut self.stream).poll_shutdown(cx).map_err(Into::into),
+        }
     }
 }

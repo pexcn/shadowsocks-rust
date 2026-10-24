@@ -360,6 +360,9 @@ struct SSConfig {
     printable_salt: Option<bool>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    tcp_popcount: Option<bool>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     keep_alive: Option<u64>,
 
     #[cfg(all(unix, not(target_os = "android")))]
@@ -1533,6 +1536,8 @@ pub struct Config {
     pub no_delay: bool,
     /// Experimental printable salts for outgoing client TCP streams.
     pub printable_salt: bool,
+    /// Experimental initial TCP request transform; must match the peer.
+    pub tcp_popcount: bool,
     /// Set `TCP_FASTOPEN` socket option
     pub fast_open: bool,
     /// Set TCP Keep-Alive duration, will set both `TCP_KEEPIDLE` and `TCP_KEEPINTVL`
@@ -1697,6 +1702,7 @@ impl Config {
 
             no_delay: false,
             printable_salt: false,
+            tcp_popcount: false,
             fast_open: false,
             keep_alive: None,
             mptcp: false,
@@ -2538,6 +2544,9 @@ impl Config {
         if config_type.is_local() {
             nconfig.printable_salt = config.printable_salt.unwrap_or(false);
         }
+        if config_type.is_local() || config_type.is_server() {
+            nconfig.tcp_popcount = config.tcp_popcount.unwrap_or(false);
+        }
 
         // TCP nodelay
         if let Some(b) = config.no_delay {
@@ -2854,6 +2863,18 @@ impl Config {
 
     /// Check if all required fields are already set
     pub fn check_integrity(&self) -> Result<(), Error> {
+        if self.tcp_popcount
+            && self
+                .server
+                .iter()
+                .any(|inst| !shadowsocks::context::Context::supports_tcp_popcount(inst.config.method()))
+        {
+            return Err(Error::new(
+                ErrorKind::Invalid,
+                "tcp_popcount requires an AEAD cipher",
+                None,
+            ));
+        }
         if self.config_type.is_local()
             && self.printable_salt
             && self.server.iter().any(|inst| {
@@ -3367,6 +3388,9 @@ impl fmt::Display for Config {
         if self.config_type.is_local() && self.printable_salt {
             jconf.printable_salt = Some(true);
         }
+        if self.tcp_popcount {
+            jconf.tcp_popcount = Some(true);
+        }
 
         if self.fast_open {
             jconf.fast_open = Some(self.fast_open);
@@ -3491,6 +3515,36 @@ pub fn read_variable_field_value(value: &str) -> Cow<'_, str> {
 #[cfg(test)]
 mod tests {
     use super::OutboundProxy;
+
+    #[cfg(any(feature = "aead-cipher", feature = "aead-cipher-2022"))]
+    #[test]
+    fn tcp_popcount_config_is_opt_in_and_requires_authenticated_ciphers() {
+        use super::{Config, ConfigType};
+
+        for config_type in [ConfigType::Local, ConfigType::Server] {
+            for (method, password, supported) in [
+                ("none", "test", false),
+                #[cfg(feature = "aead-cipher")]
+                ("aes-128-gcm", "test", true),
+                #[cfg(feature = "aead-cipher-2022")]
+                ("2022-blake3-aes-128-gcm", "AAAAAAAAAAAAAAAAAAAAAA==", true),
+            ] {
+                let mut value = serde_json::json!({
+                    "server": "127.0.0.1", "server_port": 8388,
+                    "local_address": "127.0.0.1", "local_port": 1080,
+                    "method": method, "password": password
+                });
+                let config = Config::load_from_str(&value.to_string(), config_type).unwrap();
+                assert!(!config.tcp_popcount);
+                value["tcp_popcount"] = true.into();
+                let config = Config::load_from_str(&value.to_string(), config_type).unwrap();
+                assert!(config.tcp_popcount);
+                assert_eq!(config.check_integrity().is_ok(), supported);
+                let saved = Config::load_from_str(&config.to_string(), config_type).unwrap();
+                assert!(saved.tcp_popcount);
+            }
+        }
+    }
 
     #[cfg(any(feature = "aead-cipher", feature = "aead-cipher-2022"))]
     #[test]

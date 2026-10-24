@@ -105,6 +105,11 @@ impl ServerBuilder {
         self.context.set_ipv6_first(ipv6_first);
     }
 
+    /// Enable the initial TCP request ciphertext transform.
+    pub fn set_tcp_popcount(&mut self, enabled: bool) {
+        self.context.set_tcp_popcount(enabled);
+    }
+
     /// Set security config
     pub fn set_security_config(&mut self, security: &SecurityConfig) {
         self.context.set_security_config(security)

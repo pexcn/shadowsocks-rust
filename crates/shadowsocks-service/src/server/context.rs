@@ -138,6 +138,12 @@ impl ServiceContext {
         context.set_ipv6_first(ipv6_first);
     }
 
+    /// Enable the initial TCP request ciphertext transform.
+    pub fn set_tcp_popcount(&mut self, enabled: bool) {
+        let context = Arc::get_mut(&mut self.context).expect("cannot set tcp_popcount on a shared context");
+        context.set_tcp_popcount(enabled);
+    }
+
     /// Set security config
     pub fn set_security_config(&mut self, security: &SecurityConfig) {
         let context = Arc::get_mut(&mut self.context).expect("cannot set security on a shared context");

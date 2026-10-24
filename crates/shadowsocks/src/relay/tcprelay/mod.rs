@@ -10,6 +10,7 @@ mod aead;
 #[cfg(feature = "aead-cipher-2022")]
 mod aead_2022;
 pub mod crypto_io;
+mod popcount;
 pub mod proxy_listener;
 pub mod proxy_stream;
 #[cfg(feature = "stream-cipher")]
