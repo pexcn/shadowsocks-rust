@@ -26,7 +26,7 @@ use crate::{
     net::{ConnectOpts, TcpStream as OutboundTcpStream},
     relay::{
         socks5::Address,
-        tcprelay::crypto_io::{CryptoRead, CryptoStream, CryptoWrite, StreamType},
+        tcprelay::crypto_io::{CryptoRead, CryptoStream, CryptoWrite, StreamType, TcpStreamOptions},
     },
 };
 
@@ -110,6 +110,9 @@ where
         A: Into<Address>,
         F: FnOnce(OutboundTcpStream) -> S,
     {
+        TcpStreamOptions::from_context(&context)
+            .with_server_config(svr_cfg)
+            .validate(svr_cfg.method(), StreamType::Client)?;
         let stream = match svr_cfg.timeout() {
             Some(d) => {
                 match time::timeout(
@@ -149,7 +152,8 @@ where
         A: Into<Address>,
     {
         let addr = addr.into();
-        let stream = CryptoStream::from_stream_with_identity(
+        let options = TcpStreamOptions::from_context(&context).with_server_config(svr_cfg);
+        let stream = CryptoStream::from_stream_with_identity_and_options(
             &context,
             stream,
             StreamType::Client,
@@ -157,6 +161,7 @@ where
             svr_cfg.key(),
             svr_cfg.identity_keys(),
             None,
+            options,
         );
 
         #[cfg(not(feature = "aead-cipher-2022"))]

@@ -17,7 +17,7 @@ use log::trace;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::{
-    config::ServerUserManager,
+    config::{ServerConfig, ServerUserManager},
     context::Context,
     crypto::{CipherCategory, CipherKind},
 };
@@ -71,6 +71,48 @@ pub enum StreamType {
     Client,
     /// Server -> Client
     Server,
+}
+
+/// Effective TCP transform settings for one connection or listener.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TcpStreamOptions {
+    pub printable_salt: bool,
+    pub tcp_popcount: bool,
+}
+
+impl TcpStreamOptions {
+    /// Read the global defaults without modifying the shared context.
+    pub fn from_context(context: &Context) -> Self {
+        Self {
+            printable_salt: context.printable_salt(),
+            tcp_popcount: context.tcp_popcount(),
+        }
+    }
+
+    /// Apply explicit node overrides, including `false`.
+    pub fn with_server_config(self, server: &ServerConfig) -> Self {
+        Self {
+            printable_salt: server.printable_salt().unwrap_or(self.printable_salt),
+            tcp_popcount: server.tcp_popcount().unwrap_or(self.tcp_popcount),
+        }
+    }
+
+    /// Validate the effective settings before opening a connection or listener.
+    pub fn validate(self, method: CipherKind, stream_ty: StreamType) -> io::Result<()> {
+        if self.tcp_popcount && !Context::supports_tcp_popcount(method) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "tcp_popcount requires an AEAD cipher",
+            ));
+        }
+        if stream_ty == StreamType::Client && self.printable_salt && !Context::supports_printable_salt(method) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "printable_salt requires a supported cipher with a 32-byte TCP salt",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Reader for reading encrypted data stream from shadowsocks' tunnel
@@ -366,9 +408,32 @@ impl<S> CryptoStream<S> {
         identity_keys: &[Bytes],
         user_manager: Option<Arc<ServerUserManager>>,
     ) -> Self {
+        Self::from_stream_with_identity_and_options(
+            context,
+            stream,
+            stream_ty,
+            method,
+            key,
+            identity_keys,
+            user_manager,
+            TcpStreamOptions::from_context(context),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_stream_with_identity_and_options(
+        context: &Context,
+        stream: S,
+        stream_ty: StreamType,
+        method: CipherKind,
+        key: &[u8],
+        identity_keys: &[Bytes],
+        user_manager: Option<Arc<ServerUserManager>>,
+        options: TcpStreamOptions,
+    ) -> Self {
         let category = method.category();
-        let printable_salt = stream_ty == StreamType::Client && context.printable_salt();
-        let popcount = context.tcp_popcount().then(|| {
+        let printable_salt = stream_ty == StreamType::Client && options.printable_salt;
+        let popcount = options.tcp_popcount.then(|| {
             let key = if stream_ty == StreamType::Client {
                 identity_keys.first().map_or(key, |identity| identity.as_ref())
             } else {

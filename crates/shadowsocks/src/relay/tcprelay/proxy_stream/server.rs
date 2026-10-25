@@ -19,7 +19,7 @@ use crate::{
     relay::{
         socks5::Address,
         tcprelay::{
-            crypto_io::{CryptoRead, CryptoStream, CryptoWrite, StreamType},
+            crypto_io::{CryptoRead, CryptoStream, CryptoWrite, StreamType, TcpStreamOptions},
             proxy_stream::protocol::TcpRequestHeader,
         },
     },
@@ -59,6 +59,18 @@ impl<S> ProxyServerStream<S> {
         key: &[u8],
         user_manager: Option<Arc<ServerUserManager>>,
     ) -> Self {
+        let options = TcpStreamOptions::from_context(&context);
+        Self::from_stream_with_user_manager_and_options(context, stream, method, key, user_manager, options)
+    }
+
+    pub(crate) fn from_stream_with_user_manager_and_options(
+        context: SharedContext,
+        stream: S,
+        method: CipherKind,
+        key: &[u8],
+        user_manager: Option<Arc<ServerUserManager>>,
+        options: TcpStreamOptions,
+    ) -> Self {
         #[cfg(feature = "aead-cipher-2022")]
         let writer_state = if method.is_aead_2022() {
             ProxyServerStreamWriteState::PrepareHeader(None)
@@ -71,7 +83,7 @@ impl<S> ProxyServerStream<S> {
 
         const EMPTY_IDENTITY: [Bytes; 0] = [];
         Self {
-            stream: CryptoStream::from_stream_with_identity(
+            stream: CryptoStream::from_stream_with_identity_and_options(
                 &context,
                 stream,
                 StreamType::Server,
@@ -79,6 +91,7 @@ impl<S> ProxyServerStream<S> {
                 key,
                 &EMPTY_IDENTITY,
                 user_manager,
+                options,
             ),
             context,
             writer_state,

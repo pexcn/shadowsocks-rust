@@ -413,6 +413,10 @@ pub struct ServerConfig {
     enc_key: Box<[u8]>,
     /// Handshake timeout (connect)
     timeout: Option<Duration>,
+    /// Override the printable TCP salt default for this node.
+    printable_salt: Option<bool>,
+    /// Override the initial TCP popcount default for this node.
+    tcp_popcount: Option<bool>,
 
     /// Extensible Identity Headers (AEAD-2022)
     ///
@@ -594,6 +598,8 @@ impl ServerConfig {
             identity_keys: Arc::new(identity_keys),
             user_manager: None,
             timeout: None,
+            printable_salt: None,
+            tcp_popcount: None,
             plugin: None,
             plugin_addr: None,
             remarks: None,
@@ -736,6 +742,26 @@ impl ServerConfig {
     /// Timeout
     pub fn timeout(&self) -> Option<Duration> {
         self.timeout
+    }
+
+    /// Set the printable TCP salt override; `None` inherits the global default.
+    pub fn set_printable_salt(&mut self, enabled: Option<bool>) {
+        self.printable_salt = enabled;
+    }
+
+    /// Get the printable TCP salt override.
+    pub fn printable_salt(&self) -> Option<bool> {
+        self.printable_salt
+    }
+
+    /// Set the initial TCP popcount override; `None` inherits the global default.
+    pub fn set_tcp_popcount(&mut self, enabled: Option<bool>) {
+        self.tcp_popcount = enabled;
+    }
+
+    /// Get the initial TCP popcount override.
+    pub fn tcp_popcount(&self) -> Option<bool> {
+        self.tcp_popcount
     }
 
     /// Get server's remark
@@ -1009,7 +1035,7 @@ impl ServerConfig {
 
     /// Check if it is a basic format server
     pub fn is_basic(&self) -> bool {
-        self.remarks.is_none() && self.id.is_none()
+        self.remarks.is_none() && self.id.is_none() && self.printable_salt.is_none() && self.tcp_popcount.is_none()
     }
 }
 

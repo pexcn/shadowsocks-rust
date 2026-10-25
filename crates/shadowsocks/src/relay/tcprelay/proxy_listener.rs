@@ -16,7 +16,10 @@ use crate::{
     context::SharedContext,
     crypto::CipherKind,
     net::{AcceptOpts, TcpListener},
-    relay::tcprelay::proxy_stream::server::ProxyServerStream,
+    relay::tcprelay::{
+        crypto_io::{StreamType, TcpStreamOptions},
+        proxy_stream::server::ProxyServerStream,
+    },
 };
 
 /// A TCP listener for accepting shadowsocks' client connection
@@ -27,6 +30,7 @@ pub struct ProxyListener {
     key: Box<[u8]>,
     context: SharedContext,
     user_manager: Option<Arc<ServerUserManager>>,
+    options: TcpStreamOptions,
 }
 
 static DEFAULT_ACCEPT_OPTS: LazyLock<AcceptOpts> = LazyLock::new(Default::default);
@@ -43,6 +47,9 @@ impl ProxyListener {
         svr_cfg: &ServerConfig,
         accept_opts: AcceptOpts,
     ) -> io::Result<Self> {
+        TcpStreamOptions::from_context(&context)
+            .with_server_config(svr_cfg)
+            .validate(svr_cfg.method(), StreamType::Server)?;
         let listener = match svr_cfg.tcp_external_addr() {
             ServerAddr::SocketAddr(sa) => TcpListener::bind_with_opts(sa, accept_opts).await?,
             ServerAddr::DomainName(domain, port) => {
@@ -57,12 +64,14 @@ impl ProxyListener {
 
     /// Create a `ProxyListener` from a `TcpListener`
     pub fn from_listener(context: SharedContext, listener: TcpListener, svr_cfg: &ServerConfig) -> Self {
+        let options = TcpStreamOptions::from_context(&context).with_server_config(svr_cfg);
         Self {
             listener,
             method: svr_cfg.method(),
             key: svr_cfg.key().to_vec().into_boxed_slice(),
             context,
             user_manager: svr_cfg.clone_user_manager(),
+            options,
         }
     }
 
@@ -82,12 +91,13 @@ impl ProxyListener {
         let stream = map_fn(stream);
 
         // Create a ProxyServerStream and read the target address from it
-        let stream = ProxyServerStream::from_stream_with_user_manager(
+        let stream = ProxyServerStream::from_stream_with_user_manager_and_options(
             self.context.clone(),
             stream,
             self.method,
             &self.key,
             self.user_manager.clone(),
+            self.options,
         );
 
         Ok((stream, peer_addr))

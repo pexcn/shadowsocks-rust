@@ -67,6 +67,7 @@ use ipnet::{Ipv4Net, Ipv6Net};
 use log::warn;
 use serde::{Deserialize, Serialize};
 use shadowsocks::relay::socks5::Address;
+use shadowsocks::relay::tcprelay::crypto_io::{StreamType, TcpStreamOptions};
 use shadowsocks::{
     config::{
         ManagerAddr, Mode, ReplayAttackPolicy, ServerAddr, ServerConfig, ServerSource, ServerUser, ServerUserManager,
@@ -550,6 +551,11 @@ struct SSServerExtConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     password: Option<String>,
     method: String,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    printable_salt: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tcp_popcount: Option<bool>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     users: Option<Vec<SSServerUserConfig>>,
@@ -2303,6 +2309,9 @@ impl Config {
                 };
                 nsvr.set_source(server_source);
 
+                nsvr.set_printable_salt(svr.printable_salt);
+                nsvr.set_tcp_popcount(svr.tcp_popcount);
+
                 // Extensible Identity Header, Users
                 if let Some(users) = svr.users {
                     let mut user_manager = ServerUserManager::new();
@@ -2863,29 +2872,26 @@ impl Config {
 
     /// Check if all required fields are already set
     pub fn check_integrity(&self) -> Result<(), Error> {
-        if self.tcp_popcount
-            && self
-                .server
-                .iter()
-                .any(|inst| !shadowsocks::context::Context::supports_tcp_popcount(inst.config.method()))
-        {
-            return Err(Error::new(
-                ErrorKind::Invalid,
-                "tcp_popcount requires an AEAD cipher",
-                None,
-            ));
-        }
-        if self.config_type.is_local()
-            && self.printable_salt
-            && self.server.iter().any(|inst| {
-                !shadowsocks::context::Context::supports_printable_salt(inst.config.method())
-            })
-        {
-            return Err(Error::new(
-                ErrorKind::Invalid,
-                "printable_salt requires a supported cipher with a 32-byte TCP salt",
-                None,
-            ));
+        let defaults = TcpStreamOptions {
+            printable_salt: self.printable_salt,
+            tcp_popcount: self.tcp_popcount,
+        };
+        let stream_ty = if self.config_type.is_server() || self.config_type.is_manager() {
+            StreamType::Server
+        } else {
+            StreamType::Client
+        };
+        for inst in &self.server {
+            if let Err(err) = defaults
+                .with_server_config(&inst.config)
+                .validate(inst.config.method(), stream_ty)
+            {
+                return Err(Error::new(
+                    ErrorKind::Invalid,
+                    "invalid TCP stream options",
+                    Some(format!("server {}: {err}", inst.config.addr())),
+                ));
+            }
         }
 
         if self.config_type.is_local() {
@@ -3282,6 +3288,8 @@ impl fmt::Display for Config {
                             Some(svr.export_password())
                         },
                         method: svr.method().to_string(),
+                        printable_salt: svr.printable_salt(),
+                        tcp_popcount: svr.tcp_popcount(),
                         users: svr.user_manager().map(|m| {
                             let mut vu = Vec::new();
                             for u in m.users_iter() {
@@ -3515,6 +3523,73 @@ pub fn read_variable_field_value(value: &str) -> Cow<'_, str> {
 #[cfg(test)]
 mod tests {
     use super::OutboundProxy;
+
+    #[cfg(feature = "aead-cipher")]
+    #[test]
+    fn node_tcp_overrides_preserve_inheritance_and_explicit_false() {
+        use super::{Config, ConfigType};
+        use shadowsocks::relay::tcprelay::crypto_io::TcpStreamOptions;
+
+        for config_type in [
+            ConfigType::Local,
+            ConfigType::Server,
+            #[cfg(feature = "local-online-config")]
+            ConfigType::OnlineConfig,
+        ] {
+            for global_printable in [false, true] {
+                for global_popcount in [false, true] {
+                    for printable in [None, Some(false), Some(true)] {
+                        for popcount in [None, Some(false), Some(true)] {
+                            let mut value = serde_json::json!({
+                                "local_address": "127.0.0.1", "local_port": 1080,
+                                "printable_salt": global_printable, "tcp_popcount": global_popcount,
+                                "servers": [{"server": "127.0.0.1", "server_port": 8388,
+                                    "method": "aes-256-gcm", "password": "test"}]
+                            });
+                            if let Some(enabled) = printable {
+                                value["servers"][0]["printable_salt"] = enabled.into();
+                            }
+                            if let Some(enabled) = popcount {
+                                value["servers"][0]["tcp_popcount"] = enabled.into();
+                            }
+                            let config = Config::load_from_str(&value.to_string(), config_type).unwrap();
+                            config.check_integrity().unwrap();
+                            let saved = Config::load_from_str(&config.to_string(), config_type).unwrap();
+                            assert_eq!(saved.printable_salt, config.printable_salt);
+                            assert_eq!(saved.tcp_popcount, config.tcp_popcount);
+                            let server = &saved.server[0].config;
+                            assert_eq!(server.printable_salt(), printable);
+                            assert_eq!(server.tcp_popcount(), popcount);
+                            let effective = TcpStreamOptions {
+                                printable_salt: config.printable_salt,
+                                tcp_popcount: config.tcp_popcount,
+                            }
+                            .with_server_config(server);
+                            assert_eq!(effective.printable_salt, printable.unwrap_or(config.printable_salt));
+                            assert_eq!(effective.tcp_popcount, popcount.unwrap_or(config.tcp_popcount));
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut value = serde_json::json!({
+            "local_address": "127.0.0.1", "local_port": 1080,
+            "printable_salt": true, "tcp_popcount": true,
+            "servers": [{"server": "127.0.0.1", "server_port": 8388,
+                "method": "none", "password": "", "printable_salt": false, "tcp_popcount": false}]
+        });
+        for config_type in [ConfigType::Local, ConfigType::Server] {
+            let config = Config::load_from_str(&value.to_string(), config_type).unwrap();
+            config.check_integrity().unwrap();
+        }
+        for option in ["printable_salt", "tcp_popcount"] {
+            value["servers"][0][option] = true.into();
+            let config = Config::load_from_str(&value.to_string(), ConfigType::Local).unwrap();
+            assert!(config.check_integrity().is_err());
+            value["servers"][0][option] = false.into();
+        }
+    }
 
     #[cfg(any(feature = "aead-cipher", feature = "aead-cipher-2022"))]
     #[test]

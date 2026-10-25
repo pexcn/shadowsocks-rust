@@ -23,7 +23,10 @@ use shadowsocks::{
     plugin::{Plugin, PluginMode},
     relay::{
         socks5::Address,
-        tcprelay::proxy_stream::ProxyClientStream,
+        tcprelay::{
+            crypto_io::{StreamType, TcpStreamOptions},
+            proxy_stream::ProxyClientStream,
+        },
         udprelay::{MAXIMUM_UDP_PAYLOAD_SIZE, options::UdpSocketControlData, proxy_socket::ProxySocket},
     },
 };
@@ -240,6 +243,13 @@ impl PingBalancerContext {
         check_interval: Duration,
         check_best_interval: Option<Duration>,
     ) -> io::Result<(Arc<Self>, PingBalancerContextTask)> {
+        let defaults = TcpStreamOptions::from_context(&context.context());
+        for server in &servers {
+            let config = server.server_config();
+            defaults
+                .with_server_config(config)
+                .validate(config.method(), StreamType::Client)?;
+        }
         let plugin_abortable = {
             // Start plugins for TCP proxies
 
@@ -1058,5 +1068,110 @@ impl<'a> Iterator for PingServerIter<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.iter.next().map(AsRef::as_ref)
+    }
+}
+
+#[cfg(all(test, feature = "aead-cipher"))]
+mod tests {
+    use super::*;
+    use shadowsocks::{ProxyListener, config::ServerType as CoreServerType, context::Context, crypto::CipherKind};
+    use std::sync::atomic::AtomicUsize;
+
+    async fn serve_probes(listener: ProxyListener, count: Arc<AtomicUsize>) {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            stream.get_mut().handshake().await.unwrap();
+            loop {
+                let mut line = String::new();
+                assert_ne!(stream.read_line(&mut line).await.unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            stream
+                .get_mut()
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[tokio::test]
+    async fn node_tcp_options_apply_to_probes_and_reload() {
+        time::timeout(Duration::from_secs(10), async {
+            let mut remote = Context::new(CoreServerType::Server);
+            remote.set_tcp_popcount(true);
+            let remote = Arc::new(remote);
+            let mut local = ServiceContext::new();
+            local.set_printable_salt(true);
+            local.set_tcp_popcount(true);
+            let local = Arc::new(local);
+            let mut nodes = Vec::new();
+            let mut responders = Vec::new();
+            let mut counts = Vec::new();
+            for node in [Some(false), None] {
+                let mut config = ServerConfig::new(
+                    "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+                    "test",
+                    CipherKind::AES_256_GCM,
+                )
+                .unwrap();
+                config.set_printable_salt(node);
+                config.set_tcp_popcount(node);
+                let listener = ProxyListener::bind(remote.clone(), &config).await.unwrap();
+                config.set_addr(listener.local_addr().unwrap());
+                let count = Arc::new(AtomicUsize::new(0));
+                responders.push(tokio::spawn(serve_probes(listener, count.clone())));
+                counts.push(count);
+                nodes.push(ServerInstanceConfig::with_server_config(config));
+            }
+            let mut builder = PingBalancerBuilder::new(local.clone(), Mode::TcpOnly);
+            builder.check_interval(Duration::from_secs(3600));
+            for node in &nodes {
+                builder.add_server(node.clone());
+            }
+            let balancer = builder.build().await.unwrap();
+            assert!(counts.iter().all(|count| count.load(Ordering::Relaxed) == 1));
+            let old_nodes = balancer.inner.context.load_full();
+
+            nodes[1].config.set_printable_salt(Some(true));
+            nodes[1].config.set_tcp_popcount(Some(true));
+            nodes.reverse();
+            balancer.reset_servers(nodes, &[ServerSource::Default]).await.unwrap();
+            assert!(counts.iter().all(|count| count.load(Ordering::Relaxed) == 2));
+            assert!(
+                old_nodes
+                    .servers
+                    .iter()
+                    .any(|node| node.server_config().tcp_popcount().is_none())
+            );
+            assert!(
+                balancer
+                    .servers()
+                    .all(|node| node.server_config().tcp_popcount().is_some())
+            );
+
+            let invalid =
+                ServerConfig::new("127.0.0.1:1".parse::<SocketAddr>().unwrap(), "", CipherKind::NONE).unwrap();
+            assert!(
+                balancer
+                    .reset_servers(
+                        vec![ServerInstanceConfig::with_server_config(invalid)],
+                        &[ServerSource::Default],
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(balancer.servers().count(), 2);
+            assert!(local.context().printable_salt());
+            assert!(local.context().tcp_popcount());
+            for task in responders {
+                task.abort();
+            }
+        })
+        .await
+        .unwrap();
     }
 }

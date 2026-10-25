@@ -232,3 +232,72 @@ async fn tcp_popcount_uses_the_server_identity_key_for_multi_user_requests() {
     assert_eq!(output.filled(), b"authenticated user");
     assert_eq!(server.user_key(), Some(user.as_slice()));
 }
+
+#[tokio::test]
+async fn node_tcp_overrides_isolate_concurrent_connections() {
+    use futures::future::join_all;
+    use shadowsocks::relay::socks5::Address;
+    use shadowsocks::{ProxyClientStream, ProxyListener, ServerConfig};
+    use std::{net::SocketAddr, sync::Arc, time::Duration};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    for method in [
+        #[cfg(feature = "aead-cipher")]
+        CipherKind::AES_256_GCM,
+        #[cfg(feature = "aead-cipher-2022")]
+        CipherKind::AEAD2022_BLAKE3_AES_256_GCM,
+    ] {
+        for global in [false, true] {
+            let mut local = Context::new(ServerType::Local);
+            local.set_printable_salt(global);
+            local.set_tcp_popcount(global);
+            let local = Arc::new(local);
+            let mut remote = Context::new(ServerType::Server);
+            remote.set_tcp_popcount(global);
+            let remote = Arc::new(remote);
+            let mut transfers = Vec::new();
+            for node in [None, Some(false), Some(true)] {
+                let password = match method.category() {
+                    #[cfg(feature = "aead-cipher-2022")]
+                    CipherCategory::Aead2022 => "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                    _ => "test",
+                };
+                let mut config =
+                    ServerConfig::new("127.0.0.1:0".parse::<SocketAddr>().unwrap(), password, method).unwrap();
+                config.set_printable_salt(node);
+                config.set_tcp_popcount(node);
+                let listener = ProxyListener::bind(remote.clone(), &config).await.unwrap();
+                config.set_addr(listener.local_addr().unwrap());
+                let context = local.clone();
+                transfers.push(async move {
+                    let target = Address::from("127.0.0.1:80".parse::<SocketAddr>().unwrap());
+                    let payload = b"node-scoped TCP options";
+                    let server = async {
+                        let (mut stream, _) = listener.accept().await.unwrap();
+                        assert_eq!(stream.handshake().await.unwrap(), target);
+                        let mut received = vec![0; payload.len()];
+                        stream.read_exact(&mut received).await.unwrap();
+                        assert_eq!(received, payload);
+                        stream.write_all(&received).await.unwrap();
+                    };
+                    let client = async {
+                        let mut stream = ProxyClientStream::connect(context, &config, target.clone())
+                            .await
+                            .unwrap();
+                        stream.write_all(payload).await.unwrap();
+                        let mut received = vec![0; payload.len()];
+                        stream.read_exact(&mut received).await.unwrap();
+                        assert_eq!(received, payload);
+                    };
+                    tokio::join!(server, client);
+                });
+            }
+            tokio::time::timeout(Duration::from_secs(5), join_all(transfers))
+                .await
+                .unwrap();
+            assert_eq!(local.printable_salt(), global);
+            assert_eq!(local.tcp_popcount(), global);
+            assert_eq!(remote.tcp_popcount(), global);
+        }
+    }
+}
