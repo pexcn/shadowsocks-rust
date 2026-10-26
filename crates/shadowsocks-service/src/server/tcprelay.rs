@@ -15,7 +15,7 @@ use shadowsocks::{
     ProxyListener, ServerConfig,
     crypto::CipherKind,
     net::{AcceptOpts, TcpStream as OutboundTcpStream},
-    relay::{socks5::Address, tcprelay::{ProxyServerStream, utils::copy_encrypted_bidirectional}},
+    relay::tcprelay::{ProxyServerStream, utils::copy_encrypted_bidirectional},
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
@@ -23,21 +23,9 @@ use tokio::{
     time,
 };
 
-use crate::net::{MonProxyStream, OutboundProxyStream, TcpDialer, utils::ignore_until_end};
+use crate::net::{MonProxyStream, OutboundProxyStream, utils::ignore_until_end};
 
-use super::context::ServiceContext;
-
-/// `TcpDialer` adapter that uses the server's connect-options.
-struct ServerTcpDialer<'a> {
-    context: &'a ServiceContext,
-}
-
-impl<'a> TcpDialer for ServerTcpDialer<'a> {
-    async fn dial(&self, addr: &Address) -> io::Result<OutboundTcpStream> {
-        OutboundTcpStream::connect_remote_with_opts(self.context.context_ref(), addr, self.context.connect_opts_ref())
-            .await
-    }
-}
+use super::context::{ServerTcpDialer, ServiceContext};
 
 /// Unified outbound stream: either direct or through the outbound proxy chain.
 // Not boxed: one instance per connection, boxing would add an allocation on the hot path

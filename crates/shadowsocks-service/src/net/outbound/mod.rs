@@ -166,6 +166,19 @@ impl OutboundProxyClient {
     {
         OutboundProxyDatagram::associate(self, context, dialer, connect_opts, target).await
     }
+
+    /// Establish a UDP relay that accepts a different target for each datagram.
+    pub async fn associate_udp_relay<D>(
+        &self,
+        context: &SharedContext,
+        dialer: &D,
+        connect_opts: &ConnectOpts,
+    ) -> io::Result<OutboundProxyDatagram>
+    where
+        D: TcpDialer + Sync,
+    {
+        OutboundProxyDatagram::associate_relay(self, context, dialer, connect_opts).await
+    }
 }
 
 fn hop_from_config(proxy: &OutboundProxy) -> OutboundProxyHop {

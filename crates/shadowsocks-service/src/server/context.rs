@@ -1,12 +1,12 @@
 //! Shadowsocks Local Server Context
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{io, net::SocketAddr, sync::Arc};
 
 use shadowsocks::{
     config::ServerType,
     context::{Context, SharedContext},
     dns_resolver::DnsResolver,
-    net::ConnectOpts,
+    net::{ConnectOpts, TcpStream},
     relay::Address,
 };
 
@@ -14,7 +14,7 @@ use crate::config::OutboundProxy;
 use crate::{
     acl::AccessControl,
     config::SecurityConfig,
-    net::{FlowStat, OutboundProxyClient},
+    net::{FlowStat, OutboundProxyClient, TcpDialer},
 };
 
 /// Server Service Context
@@ -31,6 +31,17 @@ pub struct ServiceContext {
 
     // Outbound proxy chain (resolved into a reusable client)
     outbound_client: Option<Arc<OutboundProxyClient>>,
+}
+
+/// Dials the first proxy hop using the server's outbound socket options.
+pub(super) struct ServerTcpDialer<'a> {
+    pub context: &'a ServiceContext,
+}
+
+impl TcpDialer for ServerTcpDialer<'_> {
+    async fn dial(&self, addr: &Address) -> io::Result<TcpStream> {
+        TcpStream::connect_remote_with_opts(self.context.context_ref(), addr, self.context.connect_opts_ref()).await
+    }
 }
 
 impl Default for ServiceContext {

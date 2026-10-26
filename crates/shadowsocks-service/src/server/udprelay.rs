@@ -24,11 +24,14 @@ use shadowsocks::{
 use tokio::{runtime::Handle, sync::mpsc, task::JoinHandle, time};
 
 use crate::net::{
-    MonProxySocket, UDP_ASSOCIATION_KEEP_ALIVE_CHANNEL_SIZE, UDP_ASSOCIATION_SEND_CHANNEL_SIZE,
+    MonProxySocket, OutboundProxyDatagram, UDP_ASSOCIATION_KEEP_ALIVE_CHANNEL_SIZE, UDP_ASSOCIATION_SEND_CHANNEL_SIZE,
     packet_window::PacketWindowFilter, utils::to_ipv4_mapped,
 };
 
-use super::context::ServiceContext;
+use super::context::{ServerTcpDialer, ServiceContext};
+
+const UDP_PROXY_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const UDP_PROXY_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy)]
 enum NatKey {
@@ -94,6 +97,14 @@ impl UdpServer {
         capacity: Option<usize>,
         accept_opts: AcceptOpts,
     ) -> io::Result<Self> {
+        if let Some(client) = context.outbound_client()
+            && !client.supports_udp()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "UDP outbound proxy requires a SOCKS5-only chain; disable UDP or change outbound_proxy",
+            ));
+        }
         let time_to_live = time_to_live.unwrap_or(crate::DEFAULT_UDP_EXPIRY_DURATION);
 
         fn create_assoc_map<K, V>(time_to_live: Duration, capacity: Option<usize>) -> LruCache<K, V>
@@ -440,6 +451,8 @@ struct UdpAssociationContext {
     peer_addr: SocketAddr,
     outbound_ipv4_socket: Option<OutboundUdpSocket>,
     outbound_ipv6_socket: Option<OutboundUdpSocket>,
+    outbound_proxy_socket: Option<OutboundProxyDatagram>,
+    outbound_proxy_retry_at: time::Instant,
     keepalive_tx: mpsc::Sender<NatKey>,
     keepalive_flag: bool,
     inbound: Arc<MonProxySocket<InboundUdpSocket>>,
@@ -487,6 +500,8 @@ impl UdpAssociationContext {
             peer_addr,
             outbound_ipv4_socket: None,
             outbound_ipv6_socket: None,
+            outbound_proxy_socket: None,
+            outbound_proxy_retry_at: time::Instant::now(),
             keepalive_tx,
             keepalive_flag: false,
             inbound,
@@ -503,6 +518,7 @@ impl UdpAssociationContext {
     async fn dispatch_packet(&mut self, mut receiver: mpsc::Receiver<UdpAssociationSendMessage>) {
         let mut outbound_ipv4_buffer = Vec::new();
         let mut outbound_ipv6_buffer = Vec::new();
+        let mut outbound_proxy_buffer = Vec::new();
         let mut keepalive_interval = time::interval(Duration::from_secs(1));
 
         loop {
@@ -547,6 +563,19 @@ impl UdpAssociationContext {
 
                     let addr = Address::from(addr);
                     self.send_received_respond_packet(addr, &outbound_ipv6_buffer[..n]).await;
+                }
+
+                received = async {
+                    let socket = self.outbound_proxy_socket.as_ref().expect("outbound proxy socket");
+                    if outbound_proxy_buffer.is_empty() {
+                        outbound_proxy_buffer.resize(MAXIMUM_UDP_PAYLOAD_SIZE, 0);
+                    }
+                    socket.recv_from(&mut outbound_proxy_buffer).await
+                }, if self.outbound_proxy_socket.is_some() => {
+                    match received {
+                        Ok((n, addr)) => self.send_received_respond_packet(addr, &outbound_proxy_buffer[..n]).await,
+                        Err(err) => self.handle_outbound_proxy_error(err),
+                    }
                 }
 
                 _ = keepalive_interval.tick() => {
@@ -650,6 +679,34 @@ impl UdpAssociationContext {
     }
 
     async fn dispatch_received_outbound_packet(&mut self, target_addr: &Address, data: &[u8]) -> io::Result<()> {
+        if let Some(client) = self.context.outbound_client() {
+            // Never enter the direct path when an outbound proxy is configured.
+            if time::Instant::now() < self.outbound_proxy_retry_at {
+                return Ok(());
+            }
+            let result = time::timeout(UDP_PROXY_CONNECT_TIMEOUT, async {
+                if self.outbound_proxy_socket.is_none() {
+                    let dialer = ServerTcpDialer { context: &self.context };
+                    let socket = client
+                        .associate_udp_relay(&self.context.context(), &dialer, self.context.connect_opts_ref())
+                        .await?;
+                    self.outbound_proxy_socket = Some(socket);
+                }
+                self.outbound_proxy_socket
+                    .as_ref()
+                    .expect("outbound proxy socket")
+                    .send_to(data, target_addr)
+                    .await
+            })
+            .await;
+            match result {
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => self.handle_outbound_proxy_error(err),
+                Err(err) => self.handle_outbound_proxy_error(err.into()),
+            }
+            return Ok(());
+        }
+
         match *target_addr {
             Address::SocketAddress(sa) => self.send_received_outbound_packet(sa, data).await,
             Address::DomainNameAddress(ref dname, port) => {
@@ -659,6 +716,21 @@ impl UdpAssociationContext {
                 .map(|_| ())
             }
         }
+    }
+
+    fn handle_outbound_proxy_error(&mut self, err: io::Error) {
+        if OutboundProxyDatagram::is_packet_error(&err) {
+            trace!("udp outbound proxy for {} dropped a datagram: {}", self.peer_addr, err);
+            return;
+        }
+        // Drop the UDP socket and every TCP control connection together.
+        // Rate-limit reconnect attempts and their logs per client association.
+        self.outbound_proxy_socket = None;
+        self.outbound_proxy_retry_at = time::Instant::now() + UDP_PROXY_RETRY_INTERVAL;
+        warn!(
+            "udp outbound proxy for {} failed: {}; retrying after 5s",
+            self.peer_addr, err
+        );
     }
 
     async fn send_received_outbound_packet(&mut self, original_target_addr: SocketAddr, data: &[u8]) -> io::Result<()> {
@@ -814,6 +886,131 @@ impl UdpAssociationContext {
                     }
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::OutboundProxy;
+    use shadowsocks::crypto::CipherKind;
+
+    #[tokio::test]
+    async fn unsupported_udp_proxy_chains_fail_before_binding() {
+        for url in ["http://127.0.0.1:9", "https://127.0.0.1:9"] {
+            let mut context = ServiceContext::new();
+            context.set_outbound_proxies(vec![
+                OutboundProxy::from_url("socks5://127.0.0.1:9").unwrap(),
+                OutboundProxy::from_url(url).unwrap(),
+            ]);
+            let config = ServerConfig::new("127.0.0.1:0".parse::<SocketAddr>().unwrap(), "", CipherKind::NONE).unwrap();
+            let result = UdpServer::new(Arc::new(context), config, None, None, AcceptOpts::default()).await;
+            match result {
+                Err(err) => assert_eq!(err.kind(), io::ErrorKind::Unsupported),
+                Ok(_) => panic!("UDP server accepted an unsupported proxy chain"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn packet_errors_do_not_interrupt_udp_proxy_associations() {
+        use shadowsocks::{
+            config::ServerType,
+            context::Context,
+            net::ConnectOpts,
+            relay::socks5::{HandshakeRequest, HandshakeResponse, Reply, TcpRequestHeader, TcpResponseHeader},
+        };
+        use std::io::Cursor;
+        use tokio::{
+            io::AsyncReadExt,
+            net::{TcpListener, UdpSocket},
+        };
+
+        for mtu in [None, Some(256)] {
+            if mtu.is_none() && !cfg!(target_os = "linux") {
+                continue;
+            }
+            let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_url = format!("socks5://{}", proxy.local_addr().unwrap());
+            let _proxy_task = crate::utils::ServerHandle(tokio::spawn(async move {
+                let (mut tcp, _) = proxy.accept().await.unwrap();
+                HandshakeRequest::read_from(&mut tcp).await.unwrap();
+                HandshakeResponse::new(0).write_to(&mut tcp).await.unwrap();
+                TcpRequestHeader::read_from(&mut tcp).await.unwrap();
+                let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                TcpResponseHeader::new(Reply::Succeeded, relay.local_addr().unwrap().into())
+                    .write_to(&mut tcp)
+                    .await
+                    .unwrap();
+                let mut packet = [0u8; 65536];
+                let mut closed = [0];
+                loop {
+                    let (n, peer) = tokio::select! {
+                        _ = tcp.read(&mut closed) => panic!("proxy control connection closed after a packet error"),
+                        result = relay.recv_from(&mut packet) => result.unwrap(),
+                    };
+                    let mut cur = Cursor::new(&packet[..n]);
+                    shadowsocks::relay::socks5::UdpAssociateHeader::read_from(&mut cur)
+                        .await
+                        .unwrap();
+                    let response = match &packet[cur.position() as usize..n] {
+                        b"bad-reserved" => vec![1, 0, 0],
+                        b"bad-fragment" => vec![0, 0, 1, 1, 127, 0, 0, 1, 0, 53],
+                        b"short-header" => vec![0, 0, 0, 4],
+                        b"large-reply" => vec![0; 300],
+                        _ => packet[..n].to_vec(),
+                    };
+                    relay.send_to(&response, peer).await.unwrap();
+                }
+            }));
+
+            let mut context = ServiceContext::new();
+            context.set_outbound_proxies(vec![OutboundProxy::from_url(&proxy_url).unwrap()]);
+            let mut opts = ConnectOpts::default();
+            opts.udp.mtu = mtu;
+            context.set_connect_opts(opts);
+            let mut config =
+                ServerConfig::new("127.0.0.1:0".parse::<SocketAddr>().unwrap(), "", CipherKind::NONE).unwrap();
+            let server = UdpServer::new(Arc::new(context), config.clone(), None, None, AcceptOpts::default())
+                .await
+                .unwrap();
+            config.set_addr(server.local_addr().unwrap());
+            let _server_task = crate::utils::ServerHandle(tokio::spawn(server.run()));
+            let client = ProxySocket::connect(Context::new_shared(ServerType::Local), &config)
+                .await
+                .unwrap();
+            let target = Address::from("127.0.0.1:53".parse::<SocketAddr>().unwrap());
+            let mut packet = [0u8; 1024];
+            client.send(&target, b"normal").await.unwrap();
+            time::timeout(Duration::from_secs(2), client.recv(&mut packet))
+                .await
+                .unwrap()
+                .unwrap();
+            for bad in [b"bad-reserved".as_slice(), b"bad-fragment", b"short-header"] {
+                client.send(&target, bad).await.unwrap();
+                client.send(&target, b"normal").await.unwrap();
+                let (n, source, _) = time::timeout(Duration::from_secs(1), client.recv(&mut packet))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(source, target);
+                assert_eq!(&packet[..n], b"normal");
+            }
+            if mtu.is_some() {
+                client.send(&target, b"large-reply").await.unwrap();
+            }
+            // Exceed either the configured MTU or the IPv4 UDP payload limit
+            // after adding the SOCKS5 header, then immediately send a good packet.
+            let oversized = vec![0; if mtu.is_some() { 1000 } else { 65500 }];
+            client.send(&target, &oversized).await.unwrap();
+            client.send(&target, b"normal").await.unwrap();
+            let (n, source, _) = time::timeout(Duration::from_secs(1), client.recv(&mut packet))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(source, target);
+            assert_eq!(&packet[..n], b"normal");
         }
     }
 }

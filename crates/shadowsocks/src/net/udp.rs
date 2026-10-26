@@ -88,7 +88,10 @@ pub struct BatchRecvMessage<'a> {
 
 #[inline]
 fn make_mtu_error(packet_size: usize, mtu: usize) -> io::Error {
-    io::Error::other(format!("UDP packet {} > MTU {}", packet_size, mtu))
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("UDP packet {} > MTU {}", packet_size, mtu),
+    )
 }
 
 /// Wrappers for outbound `UdpSocket`
